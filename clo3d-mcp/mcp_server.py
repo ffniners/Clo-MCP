@@ -4,12 +4,16 @@ Communicates with the CLO bridge plugin over TCP (127.0.0.1:9876).
 
 V1 tools: raw API access with explicit indices.
 V2 tools: semantic layer — named pieces, edge labels, garment types.
+V3 tools: reclassification, health/capabilities, transactional builds,
+          correlation IDs, structured error codes.
 """
 
 import json
 import os
 import socket
 import sys
+import uuid
+import time
 from dataclasses import asdict
 from typing import Any
 
@@ -21,23 +25,43 @@ sys.path.insert(0, os.path.dirname(__file__))
 from semantic.geometry import (
     parse_points,
     build_edges_from_creation_points,
+    build_edges_from_pattern_json,
     classify_edges,
     classify_edges_extended,
+    extract_edge_geometry,
 )
 from semantic.state_manager import StateManager
 from semantic.seam_planner import SeamPlanner
 from semantic.garment_types import (
     derive_tshirt_pieces,
+    derive_aline_skirt_pieces,
     get_garment_type,
+    get_derivation_function,
     list_garment_types,
+    load_garment_specs_from_dir,
+    register_garment_type,
     DEFAULT_TSHIRT_MEASUREMENTS,
 )
 
 BRIDGE_HOST = "127.0.0.1"
 BRIDGE_PORT = 9876
 SOCKET_TIMEOUT = 30  # seconds
+SERVER_VERSION = "3.0.0"
 
 mcp = FastMCP("clo3d")
+
+# ---------------------------------------------------------------------------
+# Standardized error codes (V3)
+# ---------------------------------------------------------------------------
+
+ERR_BRIDGE_UNAVAILABLE = "BRIDGE_UNAVAILABLE"
+ERR_BRIDGE_TIMEOUT = "BRIDGE_TIMEOUT"
+ERR_BRIDGE_ERROR = "BRIDGE_ERROR"
+ERR_PATTERN_NOT_FOUND = "PATTERN_NOT_FOUND"
+ERR_EDGE_NOT_FOUND = "EDGE_NOT_FOUND"
+ERR_GARMENT_UNKNOWN = "GARMENT_UNKNOWN"
+ERR_VALIDATION_FAILED = "VALIDATION_FAILED"
+ERR_STAGE_FAILED = "STAGE_FAILED"
 
 # ---------------------------------------------------------------------------
 # Bridge communication
@@ -68,14 +92,15 @@ def _send_to_bridge(action: str, params: dict | None = None) -> dict:
 
         line = buf.split(b"\n", 1)[0].decode("utf-8").strip()
         if not line:
-            return {"error": "Empty response from bridge"}
+            return {"error": "Empty response from bridge", "code": ERR_BRIDGE_ERROR}
         return json.loads(line)
     except ConnectionRefusedError:
-        return {"error": "Cannot connect to CLO bridge. Is CLO running with the bridge plugin loaded?"}
+        return {"error": "Cannot connect to CLO bridge. Is CLO running with the bridge plugin loaded?",
+                "code": ERR_BRIDGE_UNAVAILABLE}
     except socket.timeout:
-        return {"error": "Bridge response timed out"}
+        return {"error": "Bridge response timed out", "code": ERR_BRIDGE_TIMEOUT}
     except Exception as e:
-        return {"error": f"Bridge communication error: {e}"}
+        return {"error": f"Bridge communication error: {e}", "code": ERR_BRIDGE_ERROR}
 
 
 def _format_result(result: dict) -> str:
@@ -86,6 +111,35 @@ def _format_result(result: dict) -> str:
 def _v2_error(error: str, hint: str) -> str:
     """Return a structured V2 error response."""
     return json.dumps({"success": False, "error": error, "hint": hint}, indent=2)
+
+
+def _v3_response(
+    success: bool,
+    data: dict | None = None,
+    error: str | None = None,
+    error_code: str | None = None,
+    hint: str | None = None,
+    warnings: list[str] | None = None,
+    correlation_id: str | None = None,
+) -> str:
+    """Return a normalized V3 response envelope with correlation ID."""
+    envelope: dict[str, Any] = {
+        "success": success,
+        "correlation_id": correlation_id or str(uuid.uuid4()),
+        "server_version": SERVER_VERSION,
+        "timestamp": time.time(),
+    }
+    if data is not None:
+        envelope["data"] = data
+    if error is not None:
+        envelope["error"] = error
+    if error_code is not None:
+        envelope["error_code"] = error_code
+    if hint is not None:
+        envelope["hint"] = hint
+    if warnings:
+        envelope["warnings"] = warnings
+    return json.dumps(envelope, indent=2)
 
 
 # ---------------------------------------------------------------------------
@@ -147,7 +201,10 @@ def _create_and_register_piece(
     # Use extended classification for garment pieces (handles top_left, etc.)
     classification = classify_edges_extended(edges)
 
-    # 4. Register in state
+    # 4. Extract normalized edge geometry for storage (V3)
+    edge_geometry = extract_edge_geometry(edges, classification.labels)
+
+    # 5. Register in state
     state = _get_state()
     state.register_pattern(
         index=pattern_index,
@@ -155,6 +212,7 @@ def _create_and_register_piece(
         role=role,
         edges=classification.labels,
         pattern_json_snapshot={"creation_points": points},
+        edge_geometry=edge_geometry,
     )
 
     return {
@@ -162,6 +220,63 @@ def _create_and_register_piece(
         "pattern_index": pattern_index,
         "name": name,
         "role": role,
+        "edges": classification.labels,
+        "warnings": classification.warnings,
+    }
+
+
+def _reclassify_piece_internal(pattern_name: str) -> dict:
+    """
+    Re-derive edge labels for an existing piece from its stored snapshot.
+    Uses PatternJSON from bridge if available, otherwise falls back to
+    creation points in the snapshot.
+    """
+    state = _get_state()
+    entry = state.get_pattern_by_name(pattern_name)
+    if not entry:
+        return {
+            "success": False,
+            "error": f"Pattern '{pattern_name}' not found in state.",
+            "error_code": ERR_PATTERN_NOT_FOUND,
+        }
+
+    pattern_index = entry["index"]
+    edges = None
+
+    # Try PatternJSON from bridge first (authoritative after edits)
+    bridge_result = _send_to_bridge("export_pattern_json", {})
+    if bridge_result.get("success") and "pattern_json" in bridge_result:
+        pj = bridge_result["pattern_json"]
+        # Find matching pattern in the exported JSON
+        patterns = pj.get("Patterns", pj.get("patterns", []))
+        if isinstance(patterns, list) and pattern_index < len(patterns):
+            pattern_data = patterns[pattern_index]
+            edges = build_edges_from_pattern_json(pattern_data)
+            state.update_pattern_json_snapshot(pattern_index, pattern_data)
+
+    # Fallback: use stored creation points
+    if not edges:
+        snapshot = entry.get("pattern_json_snapshot", {})
+        creation_pts = snapshot.get("creation_points")
+        if creation_pts:
+            parsed = parse_points(creation_pts)
+            edges = build_edges_from_creation_points(parsed)
+
+    if not edges:
+        return {
+            "success": False,
+            "error": "No geometry data available for reclassification.",
+            "hint": "Recreate the piece or ensure CLO bridge is connected.",
+        }
+
+    classification = classify_edges_extended(edges)
+    edge_geometry = extract_edge_geometry(edges, classification.labels)
+
+    state.update_edges(pattern_index, classification.labels, edge_geometry)
+
+    return {
+        "success": True,
+        "pattern_name": pattern_name,
         "edges": classification.labels,
         "warnings": classification.warnings,
     }
@@ -536,10 +651,8 @@ def build_tshirt(
 ) -> str:
     """Build a complete T-shirt: create pieces, sew seams, assign fabric, simulate.
 
-    This is the "it just works" compound tool. Takes body measurements and
-    an optional fabric path, creates all 4 pattern pieces with correct
-    proportions, runs the full seam plan, optionally assigns fabric,
-    simulates, and returns the complete state summary.
+    V3: Returns structured per-stage results with correct final success semantics.
+    Each stage (pieces, fabric, seams, simulation) reports independently.
 
     Measurement parameters (all in mm):
         chest_width_mm: Full front panel width (default 500).
@@ -551,6 +664,7 @@ def build_tshirt(
         fabric_path: Optional path to a .zfab file.
         simulate_frames: Frames to simulate (default 100).
     """
+    correlation_id = str(uuid.uuid4())
     measurements = {
         "chest_width_mm": chest_width_mm,
         "body_length_mm": body_length_mm,
@@ -561,47 +675,63 @@ def build_tshirt(
     }
 
     all_warnings: list[str] = []
-    errors: list[str] = []
+    stages: list[dict] = []
 
-    # --- 1. Derive pattern coordinates from measurements ---
+    # === Stage 1: Plan — derive pattern coordinates ===
     pieces = derive_tshirt_pieces(measurements)
+    stages.append({"stage": "plan", "success": True})
 
-    # --- 2. Create each piece ---
+    # === Stage 2: Create pieces ===
     gt = get_garment_type("t_shirt")
     assert gt is not None
 
-    piece_names: dict[str, str] = {}  # role → name
+    piece_names: dict[str, str] = {}
+    piece_errors: list[str] = []
+
     for piece_def in gt.pieces:
         role = piece_def.role
-        # Generate a display name from the role
         name = role.replace("_", " ").title().replace(" ", "_")
         points = pieces[role]
 
         result = _create_and_register_piece(points, name, role)
         if not result.get("success"):
-            errors.append(f"Failed to create {name}: {result.get('error', 'unknown')}")
+            piece_errors.append(f"Failed to create {name}: {result.get('error', 'unknown')}")
             continue
         piece_names[role] = name
         all_warnings.extend(result.get("warnings", []))
 
-    if errors:
-        return json.dumps({
-            "success": False,
-            "error": f"Failed to create pieces: {errors}",
-            "hint": "Check CLO is running and bridge is loaded.",
-            "warnings": all_warnings,
-        }, indent=2)
+    pieces_success = len(piece_errors) == 0
+    stages.append({
+        "stage": "create_pieces",
+        "success": pieces_success,
+        "pieces_created": list(piece_names.values()),
+        "errors": piece_errors if piece_errors else None,
+    })
 
-    # --- 3. Optional: load and assign fabric ---
+    if not pieces_success:
+        return _v3_response(
+            success=False,
+            data={"stages": stages, "measurements": measurements},
+            error=f"Piece creation failed: {piece_errors}",
+            error_code=ERR_STAGE_FAILED,
+            hint="Check CLO is running and bridge is loaded.",
+            warnings=all_warnings,
+            correlation_id=correlation_id,
+        )
+
+    # === Stage 3: Fabric (optional) ===
+    fabric_stage: dict[str, Any] = {"stage": "fabric", "success": True, "skipped": True}
     if fabric_path:
+        fabric_stage["skipped"] = False
         fab_result = _send_to_bridge("add_fabric", {"file_path": fabric_path})
         if "error" in fab_result:
+            fabric_stage["success"] = False
+            fabric_stage["error"] = fab_result["error"]
             all_warnings.append(f"Fabric load failed: {fab_result['error']}")
         else:
             fab_idx = fab_result["fabric_index"]
             state = _get_state()
             state.register_fabric(index=fab_idx, name="tshirt_fabric", path=fabric_path)
-            # Assign to all pieces
             for role, name in piece_names.items():
                 pattern = state.get_pattern_by_name(name)
                 if pattern:
@@ -611,8 +741,9 @@ def build_tshirt(
                         "assign_option": 1,
                     })
                     state.assign_fabric_to_pattern(fab_idx, pattern["index"])
+    stages.append(fabric_stage)
 
-    # --- 4. Sew seams ---
+    # === Stage 4: Sew seams ===
     state = _get_state()
     seam_dicts = []
     for sd in gt.seam_plan:
@@ -637,23 +768,136 @@ def build_tshirt(
     seam_result = planner.execute_seam_plan(seam_dicts)
     all_warnings.extend(seam_result.warnings)
 
-    # --- 5. Simulate ---
-    _send_to_bridge("simulate", {"frames": simulate_frames})
+    stages.append({
+        "stage": "sew_seams",
+        "success": seam_result.success,
+        "seams_created": seam_result.seams_created,
+        "seams_failed": seam_result.seams_failed if seam_result.seams_failed else None,
+    })
 
-    # --- 6. Return state summary ---
+    # === Stage 5: Simulate ===
+    sim_result = _send_to_bridge("simulate", {"frames": simulate_frames})
+    sim_success = "error" not in sim_result
+    if not sim_success:
+        all_warnings.append(f"Simulation error: {sim_result.get('error')}")
+    stages.append({
+        "stage": "simulate",
+        "success": sim_success,
+        "frames": simulate_frames,
+    })
+
+    # === Final result ===
+    overall_success = pieces_success and seam_result.success
     final_state = _get_state().get_state()
 
+    return _v3_response(
+        success=overall_success,
+        data={
+            "measurements": measurements,
+            "stages": stages,
+            "pieces_created": list(piece_names.values()),
+            "seams_created": seam_result.seams_created,
+            "seams_failed": seam_result.seams_failed,
+            "simulated_frames": simulate_frames,
+            "fabric_loaded": bool(fabric_path),
+            "state": final_state,
+        },
+        warnings=all_warnings,
+        correlation_id=correlation_id,
+    )
+
+
+# ===========================================================================
+# V3 MCP Tools — Reclassification
+# ===========================================================================
+
+
+@mcp.tool()
+def reclassify_piece(pattern_name: str) -> str:
+    """Reclassify edge labels for a pattern piece after manual CLO edits.
+
+    Re-derives edge labels using PatternJSON from CLO (if available) or
+    the stored creation points snapshot. Updates state with new labels
+    and edge geometry.
+
+    Args:
+        pattern_name: Name of the pattern piece to reclassify.
+    """
+    result = _reclassify_piece_internal(pattern_name)
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def reclassify_all() -> str:
+    """Reclassify edge labels for all registered pattern pieces.
+
+    Useful after bulk manual edits in CLO. Updates all edge labels
+    and geometry in state.
+    """
+    state = _get_state()
+    state_data = state.get_state()
+    results = []
+    all_warnings: list[str] = []
+
+    for key, entry in state_data.get("patterns", {}).items():
+        name = entry.get("name", "")
+        if not name:
+            continue
+        r = _reclassify_piece_internal(name)
+        results.append(r)
+        all_warnings.extend(r.get("warnings", []))
+
+    all_success = all(r.get("success", False) for r in results)
     return json.dumps({
-        "success": True,
-        "measurements": measurements,
-        "pieces_created": list(piece_names.values()),
-        "seams_created": seam_result.seams_created,
-        "seams_failed": seam_result.seams_failed,
-        "simulated_frames": simulate_frames,
-        "fabric_loaded": bool(fabric_path),
+        "success": all_success,
+        "reclassified": [r.get("pattern_name") for r in results if r.get("success")],
+        "failed": [r for r in results if not r.get("success")],
         "warnings": all_warnings,
-        "state": final_state,
     }, indent=2)
+
+
+# ===========================================================================
+# V3 MCP Tools — Health / Capabilities
+# ===========================================================================
+
+
+@mcp.tool()
+def health() -> str:
+    """Report server health, bridge connectivity, and capabilities.
+
+    Returns server version, state revision, bridge availability,
+    registered garment types, and seam validation mode.
+    """
+    correlation_id = str(uuid.uuid4())
+
+    # Check bridge
+    bridge_result = _send_to_bridge("ping")
+    bridge_ok = bridge_result.get("success", False)
+
+    # State info
+    state = _get_state()
+    state_data = state.get_state()
+
+    from semantic.seam_planner import _get_seam_mode, _get_seam_tolerance
+
+    return _v3_response(
+        success=True,
+        data={
+            "server_version": SERVER_VERSION,
+            "bridge_connected": bridge_ok,
+            "bridge_message": bridge_result.get("message") if bridge_ok else bridge_result.get("error"),
+            "state_version": state_data.get("version"),
+            "state_revision": state_data.get("revision"),
+            "state_path": os.environ.get("CLO_MCP_STATE_PATH", "(default)"),
+            "garment_types": list_garment_types(),
+            "seam_mode": _get_seam_mode(),
+            "seam_tolerance": _get_seam_tolerance(),
+            "pattern_count": len(state_data.get("patterns", {})),
+            "seam_count": len(state_data.get("seams", [])),
+            "fabric_count": len(state_data.get("fabrics", {})),
+        },
+        correlation_id=correlation_id,
+    )
 
 
 # ---------------------------------------------------------------------------

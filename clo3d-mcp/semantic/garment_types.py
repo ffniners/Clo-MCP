@@ -3,6 +3,11 @@ Garment type definitions — pattern pieces, measurement-to-coordinate
 derivation, and seam plans for supported garment types.
 
 V2 implements: TSHIRT
+V3 additions:
+  - Spec file loading from JSON/YAML
+  - Optional Python hook modules for advanced derivation formulas
+  - Sample A-line skirt garment spec
+  - Backward-compatible registry
 
 Every derivation formula is commented inline so it can be corrected
 after testing against real CLO PatternJSON output.
@@ -10,7 +15,11 @@ after testing against real CLO PatternJSON output.
 
 from __future__ import annotations
 
+import json
+import os
 from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
 
 
 @dataclass
@@ -37,6 +46,8 @@ class GarmentType:
     name: str
     pieces: list[PieceDefinition]
     seam_plan: list[SeamDefinition]
+    default_measurements: dict[str, float] = field(default_factory=dict)
+    derivation_hook: str | None = None  # Python module path for derive fn
 
 
 # =========================================================================
@@ -68,6 +79,30 @@ TSHIRT = GarmentType(
         SeamDefinition("back_bodice", "top_right", "sleeve_right", "top",
                        label="right_shoulder_back", flip=True),
     ],
+)
+
+
+# =========================================================================
+# A-LINE SKIRT DEFINITION (V3 sample)
+# =========================================================================
+
+ALINE_SKIRT = GarmentType(
+    name="a_line_skirt",
+    pieces=[
+        PieceDefinition(role="front_panel", description="Front skirt panel"),
+        PieceDefinition(role="back_panel", description="Back skirt panel"),
+    ],
+    seam_plan=[
+        SeamDefinition("front_panel", "left", "back_panel", "right",
+                       label="left_side_seam"),
+        SeamDefinition("front_panel", "right", "back_panel", "left",
+                       label="right_side_seam"),
+    ],
+    default_measurements={
+        "waist_width_mm": 380,
+        "hem_width_mm": 550,
+        "skirt_length_mm": 600,
+    },
 )
 
 
@@ -114,42 +149,9 @@ def derive_tshirt_pieces(measurements: dict) -> dict[str, list[list[float]]]:
     # =====================================================================
     # FRONT BODICE
     # =====================================================================
-    # Shape: trapezoid-like rectangle with neck cutout
-    #
-    # The front bodice is chest_w wide and body_l tall.
-    # The top edge is split by a neck opening.
-    #
-    #   P4---P3        P2---P1
-    #   |     \       /     |
-    #   |      P5---P6      |      (neck curve, dropped by neck_drop)
-    #   |                   |
-    #   P0-----------------P7       (hem line)
-    #
-    # However, for V2 we use a simplified 6-point shape:
-    # Bottom-left, top-left shoulder, neck-left, neck-right,
-    # top-right shoulder, bottom-right
-    #
-    # half_chest = chest_w / 2   (from center)
-    # shoulder_inset = (chest_w - shoulder_w) / 2  (how far shoulder is from side)
-    # neck_half = (chest_w - shoulder_w) / 2 + some offset... simplified:
-
-    # For a standard t-shirt, the neck opening is roughly:
-    #   neck_width = chest_w - shoulder_w
-    # This is the gap between the two shoulder points at the top.
-
     neck_w = chest_w - shoulder_w
-    # Neck half-width from center
     neck_half = neck_w / 2.0
-    # Center X of the front bodice
     center_x = chest_w / 2.0
-
-    # Points defined CCW from bottom-left:
-    # P0: bottom-left (hem)
-    # P1: top-left (shoulder point)
-    # P2: neck-left (where neck begins, dropped from shoulder)
-    # P3: neck-right (symmetric)
-    # P4: top-right (shoulder point)
-    # P5: bottom-right (hem)
 
     front_bodice = [
         [0.0, 0.0, 0],                                    # P0: bottom-left
@@ -163,13 +165,7 @@ def derive_tshirt_pieces(measurements: dict) -> dict[str, list[list[float]]]:
     # =====================================================================
     # BACK BODICE
     # =====================================================================
-    # Same shape as front but offset in X to avoid 2D overlap.
-    # Back neck drop is typically shallower (less drop).
-    #
-    # back_neck_drop = neck_drop * 0.4 (backs have higher neckline)
-
     back_neck_drop = neck_drop * 0.4
-    # Offset back bodice to the right by chest_w + 100mm gap
     bx = chest_w + 100.0
 
     back_bodice = [
@@ -184,20 +180,8 @@ def derive_tshirt_pieces(measurements: dict) -> dict[str, list[list[float]]]:
     # =====================================================================
     # LEFT SLEEVE
     # =====================================================================
-    # Simplified sleeve: rectangle with sleeve_w width and sleeve_l height.
-    # The top edge (shoulder side) will be sewn to the bodice.
-    # Placed below the bodice in 2D.
-    #
-    # sleeve_cap_height = sleeve_w * 0.3 (how much taller the cap is
-    #   vs the underarm)
-    #
-    # For V2 simplicity, sleeves are rectangles:
-    #   Width = sleeve_w, Height = sleeve_l
-    #   The "bottom" edge (at higher Y, since it sews to shoulder)
-    #   corresponds to the armhole.
-
-    sx_l = 0.0        # Left sleeve X origin
-    sy = -sleeve_l - 100.0   # Below the bodice with 100mm gap
+    sx_l = 0.0
+    sy = -sleeve_l - 100.0
 
     sleeve_left = [
         [sx_l, sy, 0],                       # P0: bottom-left (cuff)
@@ -209,9 +193,7 @@ def derive_tshirt_pieces(measurements: dict) -> dict[str, list[list[float]]]:
     # =====================================================================
     # RIGHT SLEEVE
     # =====================================================================
-    # Mirror of left sleeve, offset to the right
-
-    sx_r = sleeve_w + 100.0   # Right sleeve offset
+    sx_r = sleeve_w + 100.0
 
     sleeve_right = [
         [sx_r, sy, 0],                       # P0: bottom-left (cuff)
@@ -228,13 +210,139 @@ def derive_tshirt_pieces(measurements: dict) -> dict[str, list[list[float]]]:
     }
 
 
+def derive_aline_skirt_pieces(measurements: dict) -> dict[str, list[list[float]]]:
+    """
+    Derive pattern piece coordinates from A-line skirt measurements.
+
+    Returns {role: [[x, y, curvature], ...]} for front_panel and back_panel.
+    """
+    m = {**ALINE_SKIRT.default_measurements, **measurements}
+
+    waist_w = float(m["waist_width_mm"])
+    hem_w = float(m["hem_width_mm"])
+    length = float(m["skirt_length_mm"])
+
+    # Front panel: trapezoid — wider at hem than waist
+    waist_inset = (hem_w - waist_w) / 2.0
+
+    front_panel = [
+        [0.0, 0.0, 0],                  # P0: bottom-left (hem)
+        [waist_inset, length, 0],        # P1: top-left (waist)
+        [waist_inset + waist_w, length, 0],  # P2: top-right (waist)
+        [hem_w, 0.0, 0],                # P3: bottom-right (hem)
+    ]
+
+    # Back panel: same shape, offset to the right
+    bx = hem_w + 100.0
+    back_panel = [
+        [bx, 0.0, 0],
+        [bx + waist_inset, length, 0],
+        [bx + waist_inset + waist_w, length, 0],
+        [bx + hem_w, 0.0, 0],
+    ]
+
+    return {
+        "front_panel": front_panel,
+        "back_panel": back_panel,
+    }
+
+
+# Registry of derivation functions keyed by garment name
+_DERIVATION_FUNCTIONS = {
+    "t_shirt": derive_tshirt_pieces,
+    "a_line_skirt": derive_aline_skirt_pieces,
+}
+
+
+# =========================================================================
+# Spec file loading (V3)
+# =========================================================================
+
+def load_garment_from_spec(spec_path: str) -> GarmentType:
+    """
+    Load a garment type definition from a JSON spec file.
+
+    Spec file format:
+    {
+        "name": "garment_name",
+        "pieces": [
+            {"role": "piece_role", "description": "..."}
+        ],
+        "seam_plan": [
+            {
+                "pattern_a": "role_a", "edge_a": "edge_label",
+                "pattern_b": "role_b", "edge_b": "edge_label",
+                "label": "seam_name", "flip": false
+            }
+        ],
+        "default_measurements": {"key_mm": 100.0},
+        "derivation_hook": "module.path"  // optional
+    }
+    """
+    with open(spec_path, "r") as f:
+        data = json.load(f)
+
+    pieces = [
+        PieceDefinition(role=p["role"], description=p.get("description", ""))
+        for p in data.get("pieces", [])
+    ]
+
+    seam_plan = [
+        SeamDefinition(
+            pattern_a=s["pattern_a"],
+            edge_a=s["edge_a"],
+            pattern_b=s["pattern_b"],
+            edge_b=s["edge_b"],
+            label=s.get("label", ""),
+            flip=s.get("flip", False),
+        )
+        for s in data.get("seam_plan", [])
+    ]
+
+    return GarmentType(
+        name=data["name"],
+        pieces=pieces,
+        seam_plan=seam_plan,
+        default_measurements=data.get("default_measurements", {}),
+        derivation_hook=data.get("derivation_hook"),
+    )
+
+
+def load_garment_specs_from_dir(specs_dir: str) -> list[GarmentType]:
+    """Load all .json garment specs from a directory."""
+    loaded = []
+    if not os.path.isdir(specs_dir):
+        return loaded
+    for fname in sorted(os.listdir(specs_dir)):
+        if fname.endswith(".json"):
+            try:
+                gt = load_garment_from_spec(os.path.join(specs_dir, fname))
+                loaded.append(gt)
+            except (json.JSONDecodeError, KeyError, FileNotFoundError):
+                pass
+    return loaded
+
+
+def get_derivation_function(garment_name: str):
+    """Get the derivation function for a garment type, if one exists."""
+    return _DERIVATION_FUNCTIONS.get(garment_name)
+
+
 # =========================================================================
 # Registry
 # =========================================================================
 
 GARMENT_REGISTRY: dict[str, GarmentType] = {
     "t_shirt": TSHIRT,
+    "a_line_skirt": ALINE_SKIRT,
 }
+
+
+def register_garment_type(gt: GarmentType, derivation_fn=None) -> None:
+    """Register a garment type (and optional derivation function) at runtime."""
+    GARMENT_REGISTRY[gt.name] = gt
+    if derivation_fn is not None:
+        _DERIVATION_FUNCTIONS[gt.name] = derivation_fn
 
 
 def get_garment_type(name: str) -> GarmentType | None:

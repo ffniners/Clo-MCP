@@ -1,0 +1,30 @@
+{
+  "name": "a_line_skirt",
+  "pieces": [
+    {"role": "front_panel", "description": "Front skirt panel"},
+    {"role": "back_panel", "description": "Back skirt panel"}
+  ],
+  "seam_plan": [
+    {
+      "pattern_a": "front_panel",
+      "edge_a": "left",
+      "pattern_b": "back_panel",
+      "edge_b": "right",
+      "label": "left_side_seam",
+      "flip": false
+    },
+    {
+      "pattern_a": "front_panel",
+      "edge_a": "right",
+      "pattern_b": "back_panel",
+      "edge_b": "left",
+      "label": "right_side_seam",
+      "flip": false
+    }
+  ],
+  "default_measurements": {
+    "waist_width_mm": 380,
+    "hem_width_mm": 550,
+    "skirt_length_mm": 600
+  }
+}

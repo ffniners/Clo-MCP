@@ -10,8 +10,12 @@ Validates:
   - Both edges exist in state
   - Edge lengths are within tolerance (configurable via CLO_MCP_SEAM_TOLERANCE)
 
-The tolerance check warns but does not block — the caller may have valid
-reasons for sewing edges of different lengths.
+V3 additions:
+  - Configurable seam validation mode:
+    - "warn" (default, backward compatible): warns but does not block
+    - "strict": blocks seam creation when mismatch exceeds tolerance
+  - Mode configurable via CLO_MCP_SEAM_MODE env var
+  - Real length checking from stored edge_geometry in state
 """
 
 from __future__ import annotations
@@ -36,6 +40,14 @@ def _get_seam_tolerance() -> float:
         except ValueError:
             pass
     return _DEFAULT_TOLERANCE
+
+
+def _get_seam_mode() -> str:
+    """Get seam validation mode: 'warn' (default) or 'strict'."""
+    mode = os.environ.get("CLO_MCP_SEAM_MODE", "warn").strip().lower()
+    if mode in ("warn", "strict"):
+        return mode
+    return "warn"
 
 
 @dataclass
@@ -76,6 +88,7 @@ class SeamPlanner:
         self.state = state
         self.bridge_fn = bridge_fn
         self.tolerance = _get_seam_tolerance()
+        self.mode = _get_seam_mode()
 
     def plan_seam(
         self,
@@ -138,7 +151,11 @@ class SeamPlanner:
             )
 
         # --- Edge length check ---
-        self._check_edge_lengths(entry_a, edge_a, entry_b, edge_b, warnings)
+        length_error = self._check_edge_lengths(
+            entry_a, edge_a, entry_b, edge_b, warnings
+        )
+        if length_error:
+            return length_error
 
         # --- Execute seam via bridge ---
         pattern_a_idx = entry_a["index"]
@@ -246,54 +263,86 @@ class SeamPlanner:
         entry_b: dict,
         edge_b: str,
         warnings: list[str],
-    ) -> None:
+    ) -> SeamPlanResult | None:
         """
         Check that two edges are within tolerance of each other's length.
-        Appends a warning if they differ.
 
-        This reads from the pattern_json_snapshot in state if available,
-        otherwise skips the check.
+        In 'warn' mode: appends a warning if they differ, returns None.
+        In 'strict' mode: returns a failure SeamPlanResult if mismatch
+        exceeds tolerance.
+
+        Uses stored edge_geometry from state (V3) for real length data.
+        Falls back to creation_points snapshot if edge_geometry unavailable.
         """
-        # We can estimate length from the edges dict if we have the
-        # creation points stored. For now, we rely on the snapshot
-        # containing point data that we can use to compute length.
-        # If snapshots aren't available, we skip with a note.
-
-        snapshot_a = entry_a.get("pattern_json_snapshot", {})
-        snapshot_b = entry_b.get("pattern_json_snapshot", {})
-
-        if not snapshot_a or not snapshot_b:
-            return  # Can't check without snapshots
-
-        # Try to compute from stored edge data
-        edges_a = entry_a.get("_edge_objects")
-        edges_b = entry_b.get("_edge_objects")
-
-        if not edges_a or not edges_b:
-            return
-
-        labels_a = entry_a.get("edges", {})
-        labels_b = entry_b.get("edges", {})
-
-        len_a = get_edge_length(edges_a, edge_a, labels_a)
-        len_b = get_edge_length(edges_b, edge_b, labels_b)
+        len_a = self._get_edge_length_from_state(entry_a, edge_a)
+        len_b = self._get_edge_length_from_state(entry_b, edge_b)
 
         if len_a is None or len_b is None:
-            return
+            return None  # Can't check without geometry data
 
         if len_a == 0 or len_b == 0:
-            warnings.append(
+            msg = (
                 f"Zero-length edge detected: "
                 f"{entry_a['name']}.{edge_a}={len_a}mm, "
                 f"{entry_b['name']}.{edge_b}={len_b}mm"
             )
-            return
+            warnings.append(msg)
+            if self.mode == "strict":
+                return SeamPlanResult(
+                    success=False,
+                    error=msg,
+                    hint="Zero-length edges cannot be sewn in strict mode.",
+                    warnings=warnings,
+                )
+            return None
 
         ratio = abs(len_a - len_b) / max(len_a, len_b)
         if ratio > self.tolerance:
-            warnings.append(
+            msg = (
                 f"Edge length mismatch ({ratio:.1%} > {self.tolerance:.0%} tolerance): "
                 f"{entry_a['name']}.{edge_a}={len_a:.1f}mm vs "
                 f"{entry_b['name']}.{edge_b}={len_b:.1f}mm. "
                 f"These may be the wrong edges to sew."
             )
+            if self.mode == "strict":
+                return SeamPlanResult(
+                    success=False,
+                    error=msg,
+                    hint="Seam blocked by strict mode. Adjust edges or set CLO_MCP_SEAM_MODE=warn.",
+                    warnings=warnings,
+                )
+            warnings.append(msg)
+
+        return None
+
+    def _get_edge_length_from_state(
+        self, entry: dict, edge_label: str
+    ) -> float | None:
+        """
+        Get the arc length for an edge from stored state data.
+
+        Tries edge_geometry first (V3), then falls back to rebuilding
+        from creation_points snapshot.
+        """
+        # V3: check edge_geometry stored in state
+        edge_geom = entry.get("edge_geometry", {})
+        geom_entry = edge_geom.get(edge_label)
+        if geom_entry and "arc_length" in geom_entry:
+            return geom_entry["arc_length"]
+
+        # Fallback: rebuild from creation_points snapshot
+        snapshot = entry.get("pattern_json_snapshot", {})
+        creation_pts = snapshot.get("creation_points")
+        if creation_pts:
+            from semantic.geometry import (
+                parse_points,
+                build_edges_from_creation_points,
+                classify_edges_extended,
+                get_edge_length,
+            )
+            parsed = parse_points(creation_pts)
+            edges = build_edges_from_creation_points(parsed)
+            classification = classify_edges_extended(edges)
+            return get_edge_length(edges, edge_label, classification.labels)
+
+        return None

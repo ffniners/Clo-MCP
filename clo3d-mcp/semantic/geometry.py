@@ -17,6 +17,10 @@ Edge classification rules:
   - shortest: edge with the smallest arc length
 
 For multi-segment edges (top_left, top_right, etc.), see classify_edges_extended().
+
+V3 additions:
+  - extract_edge_geometry(): produce serializable geometry dict for state storage
+  - reclassify support via classify_edges_extended + extract_edge_geometry
 """
 
 from __future__ import annotations
@@ -339,3 +343,27 @@ def get_edge_length(edges: list[Edge], label: str,
         if e.line_index == idx:
             return e.arc_length
     return None
+
+
+def extract_edge_geometry(edges: list[Edge], labels: dict[str, int]) -> dict:
+    """
+    Extract serializable geometry data from classified edges.
+
+    Returns a dict of {edge_label: {line_index, arc_length, is_curved, points}}
+    suitable for storing in state and using for downstream seam length checks.
+    """
+    geometry: dict[str, dict] = {}
+    # Build line_index → edge lookup
+    edge_by_idx = {e.line_index: e for e in edges}
+
+    for label, line_idx in labels.items():
+        edge = edge_by_idx.get(line_idx)
+        if edge is None:
+            continue
+        geometry[label] = {
+            "line_index": line_idx,
+            "arc_length": round(edge.arc_length, 4),
+            "is_curved": edge.is_curved,
+            "points": [[p.x, p.y, p.curvature] for p in edge.points],
+        }
+    return geometry
