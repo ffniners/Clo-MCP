@@ -12,6 +12,11 @@ V3 additions:
   - Revision counter for concurrency safety
   - State version 3 with migration from V2
   - Normalized edge geometry storage for downstream seam checks
+
+V4 additions:
+  - Measurements storage for parametric design modifications
+  - delete_pattern_by_name, bulk_register_patterns, clear_seams
+  - State version 4 with migration from V3
 """
 
 from __future__ import annotations
@@ -29,8 +34,8 @@ _DEFAULT_STATE_PATH = os.path.join(
     os.path.dirname(os.path.dirname(__file__)), "state", "garment_state.json"
 )
 
-STATE_VERSION = 3
-PREVIOUS_STATE_VERSION = 2
+STATE_VERSION = 4
+PREVIOUS_STATE_VERSION = 3
 
 
 def _get_state_path() -> str:
@@ -46,12 +51,13 @@ def _empty_state() -> dict:
         "fabrics": {},
         "seams": [],
         "colorways": [],
+        "measurements": {},
     }
 
 
 def _migrate_v2_to_v3(data: dict) -> dict:
     """Migrate a V2 state dict to V3 format."""
-    data["version"] = STATE_VERSION
+    data["version"] = 3
     if "revision" not in data:
         data["revision"] = 0
     if "updated_at" not in data:
@@ -60,6 +66,14 @@ def _migrate_v2_to_v3(data: dict) -> dict:
     for key, entry in data.get("patterns", {}).items():
         if "edge_geometry" not in entry:
             entry["edge_geometry"] = {}
+    return data
+
+
+def _migrate_v3_to_v4(data: dict) -> dict:
+    """Migrate a V3 state dict to V4 format."""
+    data["version"] = STATE_VERSION
+    if "measurements" not in data:
+        data["measurements"] = {}
     return data
 
 
@@ -93,7 +107,11 @@ class StateManager:
                 if version == STATE_VERSION:
                     self._state = data
                 elif version == PREVIOUS_STATE_VERSION:
-                    self._state = _migrate_v2_to_v3(data)
+                    self._state = _migrate_v3_to_v4(data)
+                    self._save()  # persist migration
+                elif version == 2:
+                    data = _migrate_v2_to_v3(data)
+                    self._state = _migrate_v3_to_v4(data)
                     self._save()  # persist migration
                 else:
                     # Unknown version — start fresh
@@ -266,6 +284,68 @@ class StateManager:
             "patternB": pattern_b_name,
             "edgeB": edge_b,
         })
+        self._save()
+
+    # -----------------------------------------------------------------
+    # Measurements (V4)
+    # -----------------------------------------------------------------
+
+    def register_measurements(self, garment_type: str, measurements: dict) -> None:
+        """Store the measurements used for the current garment."""
+        self._state["measurements"] = {
+            "garment_type": garment_type,
+            "values": deepcopy(measurements),
+        }
+        self._save()
+
+    def get_measurements(self) -> dict:
+        """Return stored measurements dict (deep copy)."""
+        return deepcopy(self._state.get("measurements", {}))
+
+    def clear_measurements(self) -> None:
+        """Clear stored measurements."""
+        self._state["measurements"] = {}
+        self._save()
+
+    # -----------------------------------------------------------------
+    # Bulk operations (V4)
+    # -----------------------------------------------------------------
+
+    def delete_pattern_by_name(self, name: str) -> bool:
+        """Remove a pattern from state by name. Returns True if found and removed."""
+        key_to_remove = None
+        for key, entry in self._state["patterns"].items():
+            if entry.get("name") == name:
+                key_to_remove = key
+                break
+        if key_to_remove is not None:
+            del self._state["patterns"][key_to_remove]
+            self._save()
+            return True
+        return False
+
+    def bulk_register_patterns(self, patterns: list[dict]) -> None:
+        """Register multiple patterns in a single save operation.
+
+        Each dict must have: index, name. Optional: role, edges,
+        pattern_json_snapshot, edge_geometry, fabric_index.
+        """
+        for p in patterns:
+            key = str(p["index"])
+            self._state["patterns"][key] = {
+                "index": p["index"],
+                "name": p["name"],
+                "role": p.get("role", ""),
+                "edges": p.get("edges", {}),
+                "fabric_index": p.get("fabric_index"),
+                "pattern_json_snapshot": p.get("pattern_json_snapshot", {}),
+                "edge_geometry": p.get("edge_geometry", {}),
+            }
+        self._save()
+
+    def clear_seams(self) -> None:
+        """Remove all seams from state. Does NOT modify CLO scene."""
+        self._state["seams"] = []
         self._save()
 
     # -----------------------------------------------------------------

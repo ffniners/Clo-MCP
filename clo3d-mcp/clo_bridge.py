@@ -102,6 +102,18 @@ def _handle_get_point_count(p):
     return {"success": True, "point_count": pattern_api.GetPointCount(
         int(p["pattern_index"]), int(p["line_index"]))}
 
+# -- V4 Handlers ----------------------------------------------------------
+
+def _handle_import_file(p):
+    file_path = str(p["file_path"])
+    result = import_api.ImportFile(file_path)
+    return {"success": bool(result), "file_path": file_path}
+
+def _handle_delete_pattern(p):
+    idx = int(p["pattern_index"])
+    result = pattern_api.DeletePattern(idx)
+    return {"success": bool(result), "pattern_index": idx}
+
 # -- Helpers ---------------------------------------------------------------
 
 def _default_export_option():
@@ -156,6 +168,9 @@ HANDLERS = {
     "export_pattern_json": _handle_export_pattern_json,
     "get_pattern_name": _handle_get_pattern_name,
     "get_point_count": _handle_get_point_count,
+    # V4
+    "import_file": _handle_import_file,
+    "delete_pattern": _handle_delete_pattern,
 }
 
 def handle_command(raw_json: str) -> str:

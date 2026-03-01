@@ -46,7 +46,7 @@ from semantic.garment_types import (
 BRIDGE_HOST = "127.0.0.1"
 BRIDGE_PORT = 9876
 SOCKET_TIMEOUT = 30  # seconds
-SERVER_VERSION = "3.0.0"
+SERVER_VERSION = "4.0.0"
 
 mcp = FastMCP("clo3d")
 
@@ -679,6 +679,7 @@ def build_tshirt(
 
     # === Stage 1: Plan — derive pattern coordinates ===
     pieces = derive_tshirt_pieces(measurements)
+    _get_state().register_measurements("t_shirt", measurements)
     stages.append({"stage": "plan", "success": True})
 
     # === Stage 2: Create pieces ===
@@ -896,6 +897,497 @@ def health() -> str:
             "seam_count": len(state_data.get("seams", [])),
             "fabric_count": len(state_data.get("fabrics", {})),
         },
+        correlation_id=correlation_id,
+    )
+
+
+# ===========================================================================
+# V4 MCP Tools — Validation
+# ===========================================================================
+
+
+@mcp.tool()
+def validate_garment(garment_type: str = "") -> str:
+    """Validate the current garment state for completeness and consistency.
+
+    Runs checks for: pattern count, orphan pieces, seam completeness,
+    duplicate seams, edge length mismatches, fabric assignment, and
+    required pieces (when garment_type is specified).
+
+    Args:
+        garment_type: Optional garment type name (e.g. "t_shirt") to
+                      validate against expected structure.
+
+    Returns validation result with errors, warnings, and checks passed.
+    """
+    from semantic.validator import GarmentValidator
+
+    correlation_id = str(uuid.uuid4())
+
+    if garment_type and not get_garment_type(garment_type):
+        return _v3_response(
+            success=False,
+            error=f"Unknown garment type: {garment_type}",
+            error_code=ERR_GARMENT_UNKNOWN,
+            hint=f"Available types: {list_garment_types()}",
+            correlation_id=correlation_id,
+        )
+
+    state = _get_state()
+    validator = GarmentValidator(state, bridge_fn=_send_to_bridge)
+    result = validator.validate(garment_type)
+
+    return _v3_response(
+        success=True,
+        data={
+            "valid": result.valid,
+            "errors": result.errors,
+            "warnings": result.warnings,
+            "checks_passed": result.checks_passed,
+        },
+        warnings=result.warnings if result.warnings else None,
+        correlation_id=correlation_id,
+    )
+
+
+# ===========================================================================
+# V4 MCP Tools — Import
+# ===========================================================================
+
+
+def _infer_role_from_name(name: str, gt) -> str:
+    """Try to match a CLO pattern name to a garment role using heuristics."""
+    name_lower = name.lower().replace(" ", "_").replace("-", "_")
+    for piece in gt.pieces:
+        role_lower = piece.role.lower()
+        if name_lower == role_lower:
+            return piece.role
+        if role_lower in name_lower:
+            return piece.role
+        role_words = role_lower.split("_")
+        if all(w in name_lower for w in role_words):
+            return piece.role
+    return ""
+
+
+@mcp.tool()
+def import_garment(file_path: str, garment_type: str = "") -> str:
+    """Import a garment from an existing CLO file and register all patterns.
+
+    Opens the file in CLO, scans for all pattern pieces, classifies
+    their edges, and registers them in garment state.
+
+    If garment_type is specified, attempts to map pattern names to
+    expected garment roles using naming heuristics.
+
+    Args:
+        file_path: Path to CLO file (.zpac, .zprj, .dxf, etc.)
+        garment_type: Optional garment type for role mapping.
+
+    Returns imported pattern summary with edge classifications.
+    """
+    correlation_id = str(uuid.uuid4())
+    all_warnings: list[str] = []
+
+    gt = None
+    if garment_type:
+        gt = get_garment_type(garment_type)
+        if not gt:
+            return _v3_response(
+                success=False,
+                error=f"Unknown garment type: {garment_type}",
+                error_code=ERR_GARMENT_UNKNOWN,
+                hint=f"Available types: {list_garment_types()}",
+                correlation_id=correlation_id,
+            )
+
+    # Stage 1: Import file into CLO
+    import_result = _send_to_bridge("import_file", {"file_path": file_path})
+    if "error" in import_result:
+        return _v3_response(
+            success=False,
+            error=f"Import failed: {import_result['error']}",
+            error_code=ERR_BRIDGE_ERROR,
+            hint="Check the file path exists and CLO supports this format.",
+            correlation_id=correlation_id,
+        )
+
+    # Stage 2: Scan patterns in scene
+    scene_result = _send_to_bridge("get_scene_state")
+    if "error" in scene_result:
+        return _v3_response(
+            success=False,
+            error=f"Failed to scan scene: {scene_result['error']}",
+            error_code=ERR_BRIDGE_ERROR,
+            correlation_id=correlation_id,
+        )
+
+    clo_patterns = scene_result.get("patterns", [])
+    if not clo_patterns:
+        return _v3_response(
+            success=False,
+            error="No patterns found in scene after import.",
+            hint="The file may be empty or in an unsupported format.",
+            correlation_id=correlation_id,
+        )
+
+    # Stage 3: Export PatternJSON for geometry
+    pj_result = _send_to_bridge("export_pattern_json", {})
+    pattern_json_data = None
+    if pj_result.get("success") and "pattern_json" in pj_result:
+        pattern_json_data = pj_result["pattern_json"]
+    else:
+        all_warnings.append(
+            "Could not export PatternJSON; edge classification may be limited."
+        )
+
+    # Stage 4: Classify edges and build bulk registration list
+    registered: list[dict] = []
+    bulk_entries: list[dict] = []
+
+    for clo_pat in clo_patterns:
+        idx = clo_pat["index"]
+        name = clo_pat.get("name", f"pattern_{idx}")
+
+        role = ""
+        if gt:
+            role = _infer_role_from_name(name, gt)
+
+        edges_list = None
+        pattern_snapshot: dict = {}
+        if pattern_json_data:
+            patterns_list = pattern_json_data.get(
+                "Patterns", pattern_json_data.get("patterns", [])
+            )
+            if isinstance(patterns_list, list) and idx < len(patterns_list):
+                pattern_data = patterns_list[idx]
+                edges_list = build_edges_from_pattern_json(pattern_data)
+                pattern_snapshot = pattern_data
+
+        if edges_list:
+            classification = classify_edges_extended(edges_list)
+            edge_geometry = extract_edge_geometry(
+                edges_list, classification.labels
+            )
+            all_warnings.extend(classification.warnings)
+            bulk_entries.append({
+                "index": idx,
+                "name": name,
+                "role": role,
+                "edges": classification.labels,
+                "edge_geometry": edge_geometry,
+                "pattern_json_snapshot": pattern_snapshot,
+                "fabric_index": clo_pat.get("fabric_index"),
+            })
+        else:
+            bulk_entries.append({
+                "index": idx,
+                "name": name,
+                "role": role,
+                "edges": {},
+                "edge_geometry": {},
+                "pattern_json_snapshot": {},
+                "fabric_index": clo_pat.get("fabric_index"),
+            })
+            all_warnings.append(
+                f"No geometry data for pattern '{name}' (index {idx})."
+            )
+
+        registered.append({"name": name, "index": idx, "role": role})
+
+    # Bulk register all patterns
+    state = _get_state()
+    state.bulk_register_patterns(bulk_entries)
+
+    return _v3_response(
+        success=True,
+        data={
+            "file_path": file_path,
+            "patterns_imported": registered,
+            "pattern_count": len(registered),
+            "garment_type": garment_type or None,
+        },
+        warnings=all_warnings if all_warnings else None,
+        correlation_id=correlation_id,
+    )
+
+
+# ===========================================================================
+# V4 MCP Tools — Parametric Design Modifications
+# ===========================================================================
+
+
+@mcp.tool()
+def get_current_measurements() -> str:
+    """Return the measurements stored for the current garment.
+
+    Returns the measurement values used to build the current garment,
+    or an empty result if no measurements have been recorded.
+    """
+    state = _get_state()
+    measurements = state.get_measurements()
+    return _v3_response(
+        success=True,
+        data={"measurements": measurements},
+        correlation_id=str(uuid.uuid4()),
+    )
+
+
+@mcp.tool()
+def modify_measurement(key: str, value: float) -> str:
+    """Update a single measurement value for the current garment.
+
+    Modifies the stored measurement but does NOT rebuild the garment.
+    Call resize_garment() after modifying to apply changes.
+
+    Args:
+        key: Measurement key (e.g. "chest_width_mm", "body_length_mm").
+        value: New value in mm.
+
+    Returns updated measurements dict.
+    """
+    correlation_id = str(uuid.uuid4())
+    state = _get_state()
+    measurements = state.get_measurements()
+
+    if not measurements or not measurements.get("values"):
+        return _v3_response(
+            success=False,
+            error="No measurements stored. Build a garment first.",
+            hint="Use build_tshirt() to create a garment with measurements.",
+            correlation_id=correlation_id,
+        )
+
+    old_value = measurements["values"].get(key)
+    measurements["values"][key] = value
+    state.register_measurements(
+        garment_type=measurements.get("garment_type", ""),
+        measurements=measurements["values"],
+    )
+
+    return _v3_response(
+        success=True,
+        data={
+            "key": key,
+            "old_value": old_value,
+            "new_value": value,
+            "measurements": measurements["values"],
+        },
+        correlation_id=correlation_id,
+    )
+
+
+@mcp.tool()
+def resize_garment(
+    fabric_path: str = "",
+    simulate_frames: int = 100,
+) -> str:
+    """Rebuild the current garment using stored measurements.
+
+    Reads measurements from state, re-derives all pattern pieces,
+    deletes old patterns from CLO, creates new ones, re-sews seams,
+    optionally re-assigns fabric, and simulates.
+
+    Modify measurements first with modify_measurement(), then call
+    this to rebuild the garment with updated dimensions.
+
+    Args:
+        fabric_path: Optional path to .zfab file. If empty, reuses
+                     the previously assigned fabric path.
+        simulate_frames: Simulation frames (default 100).
+
+    Returns per-stage results showing what was rebuilt.
+    """
+    global _seam_planner
+
+    correlation_id = str(uuid.uuid4())
+    all_warnings: list[str] = []
+    stages: list[dict] = []
+
+    state = _get_state()
+    measurements = state.get_measurements()
+
+    if not measurements or not measurements.get("values"):
+        return _v3_response(
+            success=False,
+            error="No measurements stored.",
+            hint="Use build_tshirt() first, or modify_measurement() to set values.",
+            correlation_id=correlation_id,
+        )
+
+    garment_type = measurements.get("garment_type", "")
+    gt = get_garment_type(garment_type)
+    if not gt:
+        return _v3_response(
+            success=False,
+            error=f"Unknown garment type: {garment_type}",
+            error_code=ERR_GARMENT_UNKNOWN,
+            correlation_id=correlation_id,
+        )
+
+    derive_fn = get_derivation_function(garment_type)
+    if not derive_fn:
+        return _v3_response(
+            success=False,
+            error=f"No derivation function for: {garment_type}",
+            correlation_id=correlation_id,
+        )
+
+    # Stage 1: Capture old state for cleanup
+    old_state = state.get_state()
+    old_fabric_path = ""
+    old_fabric_name = ""
+    for fab_entry in old_state.get("fabrics", {}).values():
+        old_fabric_path = fab_entry.get("path", "")
+        old_fabric_name = fab_entry.get("name", "")
+        break
+
+    effective_fabric_path = fabric_path or old_fabric_path
+    stages.append({"stage": "read_measurements", "success": True})
+
+    # Stage 2: Delete old patterns from CLO
+    delete_errors: list[str] = []
+    for key, entry in old_state.get("patterns", {}).items():
+        del_result = _send_to_bridge(
+            "delete_pattern", {"pattern_index": entry["index"]}
+        )
+        if "error" in del_result:
+            delete_errors.append(
+                f"Failed to delete {entry['name']}: {del_result['error']}"
+            )
+
+    # Clear state and re-register measurements
+    state.clear()
+    state.register_measurements(garment_type, measurements["values"])
+    # Reset planner singleton so it reads fresh state
+    _seam_planner = None
+
+    stages.append({
+        "stage": "delete_old_patterns",
+        "success": len(delete_errors) == 0,
+        "errors": delete_errors if delete_errors else None,
+    })
+    if delete_errors:
+        all_warnings.extend(delete_errors)
+
+    # Stage 3: Re-derive pieces from measurements
+    pieces = derive_fn(measurements["values"])
+    stages.append({"stage": "derive_pieces", "success": True})
+
+    # Stage 4: Create new pieces
+    piece_names: dict[str, str] = {}
+    piece_errors: list[str] = []
+
+    for piece_def in gt.pieces:
+        role = piece_def.role
+        name = role.replace("_", " ").title().replace(" ", "_")
+        points = pieces[role]
+
+        result = _create_and_register_piece(points, name, role)
+        if not result.get("success"):
+            piece_errors.append(
+                f"Failed to create {name}: {result.get('error', 'unknown')}"
+            )
+            continue
+        piece_names[role] = name
+        all_warnings.extend(result.get("warnings", []))
+
+    pieces_success = len(piece_errors) == 0
+    stages.append({
+        "stage": "create_pieces",
+        "success": pieces_success,
+        "pieces_created": list(piece_names.values()),
+        "errors": piece_errors if piece_errors else None,
+    })
+
+    if not pieces_success:
+        return _v3_response(
+            success=False,
+            data={"stages": stages},
+            error=f"Piece creation failed: {piece_errors}",
+            error_code=ERR_STAGE_FAILED,
+            warnings=all_warnings,
+            correlation_id=correlation_id,
+        )
+
+    # Stage 5: Fabric (re-apply)
+    fabric_stage: dict[str, Any] = {
+        "stage": "fabric", "success": True, "skipped": True,
+    }
+    if effective_fabric_path:
+        fabric_stage["skipped"] = False
+        fab_result = _send_to_bridge(
+            "add_fabric", {"file_path": effective_fabric_path}
+        )
+        if "error" in fab_result:
+            fabric_stage["success"] = False
+            fabric_stage["error"] = fab_result["error"]
+        else:
+            fab_idx = fab_result["fabric_index"]
+            fab_name = old_fabric_name or "garment_fabric"
+            state.register_fabric(
+                index=fab_idx, name=fab_name, path=effective_fabric_path
+            )
+            for role, name in piece_names.items():
+                pattern = state.get_pattern_by_name(name)
+                if pattern:
+                    _send_to_bridge("assign_fabric", {
+                        "fabric_index": fab_idx,
+                        "pattern_index": pattern["index"],
+                        "assign_option": 1,
+                    })
+                    state.assign_fabric_to_pattern(fab_idx, pattern["index"])
+    stages.append(fabric_stage)
+
+    # Stage 6: Re-sew seams
+    seam_dicts = []
+    for sd in gt.seam_plan:
+        entry_a = state.get_pattern_by_role(sd.pattern_a)
+        entry_b = state.get_pattern_by_role(sd.pattern_b)
+        if not entry_a or not entry_b:
+            all_warnings.append(f"Skipping seam {sd.label}: missing piece")
+            continue
+        seam_dicts.append({
+            "pattern_a": entry_a["name"],
+            "edge_a": sd.edge_a,
+            "pattern_b": entry_b["name"],
+            "edge_b": sd.edge_b,
+            "flip": sd.flip,
+            "label": sd.label,
+        })
+
+    planner = _get_planner()
+    seam_result = planner.execute_seam_plan(seam_dicts)
+    all_warnings.extend(seam_result.warnings)
+
+    stages.append({
+        "stage": "sew_seams",
+        "success": seam_result.success,
+        "seams_created": seam_result.seams_created,
+        "seams_failed": seam_result.seams_failed if seam_result.seams_failed else None,
+    })
+
+    # Stage 7: Simulate
+    sim_result = _send_to_bridge("simulate", {"frames": simulate_frames})
+    sim_success = "error" not in sim_result
+    if not sim_success:
+        all_warnings.append(f"Simulation error: {sim_result.get('error')}")
+    stages.append({
+        "stage": "simulate", "success": sim_success, "frames": simulate_frames,
+    })
+
+    overall_success = pieces_success and seam_result.success
+
+    return _v3_response(
+        success=overall_success,
+        data={
+            "measurements": measurements["values"],
+            "garment_type": garment_type,
+            "stages": stages,
+            "pieces_created": list(piece_names.values()),
+            "seams_created": seam_result.seams_created,
+        },
+        warnings=all_warnings if all_warnings else None,
         correlation_id=correlation_id,
     )
 

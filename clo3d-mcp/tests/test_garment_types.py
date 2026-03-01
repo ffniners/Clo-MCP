@@ -20,6 +20,7 @@ from semantic.garment_types import (
     load_garment_specs_from_dir,
     register_garment_type,
     get_derivation_function,
+    _polyline_arc_length,
     GarmentType,
     PieceDefinition,
     SeamDefinition,
@@ -33,30 +34,53 @@ class TestDeriveTshirtPieces:
         pieces = derive_tshirt_pieces({})
         assert set(pieces.keys()) == {"front_bodice", "back_bodice", "sleeve_left", "sleeve_right"}
 
-    def test_front_bodice_has_six_points(self):
+    def test_front_bodice_has_eight_points(self):
+        """V4: front bodice has 8 points (armhole cutouts add 2 points)."""
         pieces = derive_tshirt_pieces({})
-        assert len(pieces["front_bodice"]) == 6
+        assert len(pieces["front_bodice"]) == 8
 
-    def test_sleeves_are_rectangles(self):
+    def test_back_bodice_has_eight_points(self):
+        """V4: back bodice has 8 points (armhole cutouts add 2 points)."""
         pieces = derive_tshirt_pieces({})
-        assert len(pieces["sleeve_left"]) == 4
-        assert len(pieces["sleeve_right"]) == 4
+        assert len(pieces["back_bodice"]) == 8
+
+    def test_sleeves_have_five_points(self):
+        """V4: sleeves have 5 points (curved cap replaces flat top)."""
+        pieces = derive_tshirt_pieces({})
+        assert len(pieces["sleeve_left"]) == 5
+        assert len(pieces["sleeve_right"]) == 5
+
+    def test_sleeve_cap_has_bezier(self):
+        """V4: sleeve cap apex point has curvature=3 (bezier)."""
+        pieces = derive_tshirt_pieces({})
+        sleeve = pieces["sleeve_left"]
+        # P2 is the cap apex — should have curvature=3
+        assert sleeve[2][2] == 3
+
+    def test_bodice_armhole_has_bezier(self):
+        """V4: bodice armhole points have curvature=3."""
+        pieces = derive_tshirt_pieces({})
+        front = pieces["front_bodice"]
+        # P2 (left armhole top) and P5 (right armhole top) should be bezier
+        assert front[2][2] == 3
+        assert front[5][2] == 3
 
     def test_custom_measurements_override(self):
         custom = {"chest_width_mm": 600, "body_length_mm": 800}
         pieces = derive_tshirt_pieces(custom)
         front = pieces["front_bodice"]
-        # Bottom-right X should be chest_width = 600
-        assert front[5][0] == 600.0
-        # Top-left Y should be body_length = 800
-        assert front[1][1] == 800.0
+        # Bottom-right X should be chest_width = 600 (P7 in 8-point bodice)
+        assert front[7][0] == 600.0
+        # P1 Y should be body_l - armhole_depth
+        # P2 Y should be body_length = 800
+        assert front[2][1] == 800.0
 
     def test_neck_bezier_points(self):
         pieces = derive_tshirt_pieces({})
         front = pieces["front_bodice"]
-        # Points 2 and 3 should have curvature = 3 (bezier)
-        assert front[2][2] == 3
+        # P3 and P4 are neck points (in 8-point bodice)
         assert front[3][2] == 3
+        assert front[4][2] == 3
 
     def test_back_bodice_offset(self):
         pieces = derive_tshirt_pieces({})
@@ -69,15 +93,36 @@ class TestDeriveTshirtPieces:
         pieces = derive_tshirt_pieces({})
         front = pieces["front_bodice"]
         back = pieces["back_bodice"]
-        # Front neck drop (P2 Y offset from P1 Y)
-        front_neck_y = front[2][1]
-        front_shoulder_y = front[1][1]
+        # Front neck P3 Y vs shoulder P2 Y
+        front_neck_y = front[3][1]
+        front_shoulder_y = front[2][1]
         front_drop = front_shoulder_y - front_neck_y
-        # Back neck drop
-        back_neck_y = back[2][1]
-        back_shoulder_y = back[1][1]
+        # Back neck P3 Y vs shoulder P2 Y
+        back_neck_y = back[3][1]
+        back_shoulder_y = back[2][1]
         back_drop = back_shoulder_y - back_neck_y
         assert back_drop < front_drop
+
+    def test_sleeve_cap_height(self):
+        """V4: sleeve cap height = sleeve_width * 0.3."""
+        pieces = derive_tshirt_pieces({})
+        sleeve = pieces["sleeve_left"]
+        sleeve_w = DEFAULT_TSHIRT_MEASUREMENTS["sleeve_width_mm"]
+        expected_cap_height = sleeve_w * 0.3
+        # Cap apex Y (P2) minus underarm Y (P1) should equal cap_height
+        cap_apex_y = sleeve[2][1]
+        underarm_y = sleeve[1][1]
+        assert abs((cap_apex_y - underarm_y) - expected_cap_height) < 1e-6
+
+    def test_armhole_depth(self):
+        """V4: armhole depth = sleeve_width * 0.5."""
+        pieces = derive_tshirt_pieces({})
+        front = pieces["front_bodice"]
+        sleeve_w = DEFAULT_TSHIRT_MEASUREMENTS["sleeve_width_mm"]
+        body_l = DEFAULT_TSHIRT_MEASUREMENTS["body_length_mm"]
+        expected_depth = sleeve_w * 0.5
+        # P1 Y should be body_l - armhole_depth
+        assert abs(front[1][1] - (body_l - expected_depth)) < 1e-6
 
 
 class TestDeriveAlineSkirtPieces:

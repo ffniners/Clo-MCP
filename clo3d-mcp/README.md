@@ -5,24 +5,23 @@ An MCP server that lets Claude control CLO3D garment design software via its Pyt
 **V1** provides raw API access with explicit pattern/line indices.
 **V2** adds a semantic layer — named pieces, automatic edge classification, and garment type definitions that let Claude describe garments naturally.
 **V3** adds authoritative geometry classification, real seam length validation, transactional builds, garment extensibility, atomic state persistence, and protocol observability.
+**V4** adds parametric design modifications, curved sleeve caps and armholes, CLO file import, and garment validation.
 
-## V3 Highlights
+## V4 Highlights
 
-- **Authoritative geometry classification**: Edge labels are derived from PatternJSON. New `reclassify_piece` and `reclassify_all` tools update labels after manual CLO edits.
-- **Real seam length validation**: Seam length checking operates on stored edge geometry. Supports `warn` (default) and `strict` mode via `CLO_MCP_SEAM_MODE` env var.
-- **Transactional compound operations**: `build_tshirt` returns structured per-stage results (plan, create_pieces, fabric, sew_seams, simulate) with correct final success semantics.
-- **Garment type extensibility**: New garment types can be defined via JSON spec files. A-line skirt is included as a sample. Registry supports runtime registration.
-- **State robustness**: Atomic writes (temp file + `os.replace`), revision counter, `updated_at` timestamp, and automatic migration from V2 state format.
-- **Protocol observability**: Request correlation IDs, normalized V3 response envelope, standardized error codes, and a `health` endpoint reporting bridge/API status.
-- **Test coverage**: 124 tests covering geometry, state manager, seam planner, MCP tools, garment types, and integration via fake bridge socket.
+- **Parametric design modifications**: Modify individual measurements and rebuild garments with `modify_measurement`, `get_current_measurements`, and `resize_garment`. The full pipeline (delete old patterns, re-derive, re-create, re-sew, re-apply fabric) runs automatically.
+- **Curved sleeve caps and armholes**: T-shirt sleeves now use a 5-point bezier sleeve cap instead of a flat rectangle. Bodice pieces have 8-point shapes with armhole cutouts. Sleeve cap arc length is designed to match armhole arc length.
+- **Import from CLO files**: `import_garment` opens a `.zprj`/`.zpac` file in CLO, scans all patterns, classifies edges, and registers them in state. Supports optional role mapping by garment type.
+- **Garment validation**: `validate_garment` runs pre-flight checks (seam completeness, duplicate seams, edge length mismatches, fabric assignment, orphan pieces, pattern count) and returns a structured report.
+- **State version 4**: Adds `measurements` storage. Automatic migration from V2 and V3 state files.
+- **Test coverage**: 166 tests covering all features.
 
-### Migration from V2
+### Migration from V3
 
-- **State file**: V2 state files (version 2) are automatically migrated to V3 format on first load. The migration adds `revision`, `updated_at`, and `edge_geometry` fields.
-- **Tools**: All V2 tools remain available with identical parameters. No breaking changes.
-- **New tools**: `reclassify_piece`, `reclassify_all`, `health` are V3 additions.
-- **build_tshirt**: Now returns a V3 response envelope with `correlation_id`, `server_version`, `timestamp`, and per-stage `data.stages` array. The `success` field still works as before.
-- **Seam validation**: Default behavior is unchanged (`warn` mode). Set `CLO_MCP_SEAM_MODE=strict` to block seams with length mismatches.
+- **State file**: V3 state files are automatically migrated to V4 on first load. The migration adds the `measurements` key.
+- **Tools**: All V1/V2/V3 tools remain available. No breaking changes.
+- **Geometry change**: T-shirt derivation now produces curved sleeves (5 points) and armhole bodice (8 points). The seam plan uses `curved_0`/`curved_1` labels for sleeve cap edges.
+- **build_tshirt**: Now stores measurements in state for later parametric modifications.
 
 ## Architecture
 
@@ -32,23 +31,25 @@ Claude (MCP Client)
 mcp_server.py (external Python process)
     ├── V1: raw bridge calls
     ├── V2: semantic layer (geometry resolver, state manager, seam planner)
-    └── V3: reclassification, health, transactional builds
+    ├── V3: reclassification, health, transactional builds
+    └── V4: parametric modification, import, validation
     ↓ TCP socket (127.0.0.1:9876, newline-delimited JSON)
 clo_bridge.py (Python plugin loaded inside CLO)
     ↓ direct function calls
-CLO Python API (pattern_api, fabric_api, export_api, utility_api)
+CLO Python API (pattern_api, fabric_api, export_api, import_api, utility_api)
 ```
 
-### V2/V3 Semantic Layer
+### Semantic Layer
 
 ```
 mcp_server.py
     ↓
 semantic/
     geometry.py       ← classifies edges by position/length/curvature
-    state_manager.py  ← persists patterns, fabrics, seams to JSON (atomic writes)
+    state_manager.py  ← persists patterns, fabrics, seams, measurements to JSON (atomic writes)
     seam_planner.py   ← maps named edges to line indices, validates lengths (warn/strict)
     garment_types.py  ← garment definitions + measurement→coordinate derivation + spec loading
+    validator.py      ← pre-flight garment validation checks (V4)
 ```
 
 ## Prerequisites
@@ -143,6 +144,16 @@ Restart Claude Desktop. The `clo3d` tools will appear in the tool list.
 | `reclassify_piece` | Re-derive edge labels for a pattern piece after manual CLO edits |
 | `reclassify_all` | Reclassify edge labels for all registered pattern pieces |
 | `health` | Report server version, bridge connectivity, capabilities, and seam mode |
+
+## V4 Tools
+
+| Tool | Description |
+|------|-------------|
+| `get_current_measurements` | Return stored measurements for the current garment |
+| `modify_measurement` | Update a single measurement value (does not rebuild) |
+| `resize_garment` | Rebuild garment from stored measurements: delete old patterns, re-derive, re-create, re-sew, re-apply fabric |
+| `import_garment` | Import a CLO file, scan patterns, classify edges, register in state |
+| `validate_garment` | Pre-flight validation: seam completeness, duplicates, edge lengths, fabric, orphan pieces |
 
 ## Geometry Resolver
 
@@ -245,19 +256,19 @@ The `build_tshirt` tool accepts these measurements (all in mm):
 | `fabric_path` | (none) | Optional path to `.zfab` file |
 | `simulate_frames` | 100 | Simulation frame count |
 
-### Derivation Formulas
+### Derivation Formulas (V4)
 
 All formulas are documented in `semantic/garment_types.py`:
 
-- **Front bodice**: 6-point shape — `chest_width_mm` wide, `body_length_mm` tall, with bezier neck opening derived from `neck_drop_mm` and `shoulder_width_mm`
-- **Back bodice**: Same as front but with shallower neck drop (40% of front), offset in 2D
-- **Sleeves**: Rectangles — `sleeve_width_mm` x `sleeve_length_mm`, placed below bodice panels
+- **Front bodice**: 8-point shape with armhole cutouts — `chest_width_mm` wide, `body_length_mm` tall, bezier neck opening, and bezier armhole curves. Armhole depth = `sleeve_width_mm * 0.5`.
+- **Back bodice**: Same as front but with shallower neck drop (40% of front), offset in 2D.
+- **Sleeves**: 5-point shapes with curved bezier sleeve cap — `sleeve_width_mm` wide, `sleeve_length_mm` tall. Cap height = `sleeve_width_mm * 0.3`. Two curved edges (`curved_0`, `curved_1`) form the cap and are sewn to the bodice armholes.
 
-## State File Schema (V3)
+## State File Schema (V4)
 
 ```json
 {
-  "version": 3,
+  "version": 4,
   "revision": 42,
   "updated_at": 1709000000.0,
   "patterns": {
@@ -266,17 +277,17 @@ All formulas are documented in `semantic/garment_types.py`:
       "name": "Front_Bodice",
       "role": "front_bodice",
       "edges": {
-        "top": 1, "bottom": 5, "left": 0, "right": 4,
-        "curved": 2, "longest": 0, "shortest": 2,
-        "top_left": 1, "top_right": 3
+        "top": 1, "bottom": 7, "left": 0, "right": 6,
+        "curved": 2, "curved_0": 1, "curved_1": 2,
+        "top_left": 1, "top_right": 5
       },
       "fabric_index": 0,
       "pattern_json_snapshot": {
-        "creation_points": [[0,0,0], [0,700,0], ...]
+        "creation_points": [[0,0,0], [0,610,0], ...]
       },
       "edge_geometry": {
-        "top": {"line_index": 1, "arc_length": 300.0, "is_curved": false, "points": [...]},
-        "left": {"line_index": 0, "arc_length": 700.0, "is_curved": false, "points": [...]}
+        "top_left": {"line_index": 1, "arc_length": 90.0, "is_curved": true, "points": [...]},
+        "left": {"line_index": 0, "arc_length": 610.0, "is_curved": false, "points": [...]}
       }
     }
   },
@@ -286,19 +297,30 @@ All formulas are documented in `semantic/garment_types.py`:
   "seams": [
     {"group_name": "left_side_seam", "patternA": "Front_Bodice", "edgeA": "left", "patternB": "Back_Bodice", "edgeB": "right"}
   ],
-  "colorways": []
+  "colorways": [],
+  "measurements": {
+    "garment_type": "t_shirt",
+    "values": {
+      "chest_width_mm": 500,
+      "body_length_mm": 700,
+      "shoulder_width_mm": 420,
+      "sleeve_length_mm": 220,
+      "sleeve_width_mm": 180,
+      "neck_drop_mm": 80
+    }
+  }
 }
 ```
 
-### V3 Response Envelope
+### Response Envelope
 
-V3 compound tools (`build_tshirt`, `health`) return a normalized response envelope:
+V3+ compound tools (`build_tshirt`, `health`, `validate_garment`, `import_garment`, `resize_garment`, etc.) return a normalized response envelope:
 
 ```json
 {
   "success": true,
   "correlation_id": "uuid-v4",
-  "server_version": "3.0.0",
+  "server_version": "4.0.0",
   "timestamp": 1709000000.0,
   "data": { ... },
   "warnings": ["..."],
@@ -411,6 +433,35 @@ health()
 # Returns: server version, bridge status, seam mode, registered garment types, etc.
 ```
 
+### Example 7: Modify Measurement and Resize (V4)
+
+```
+# Step 1: Build initial T-shirt
+build_tshirt(chest_width_mm=500, body_length_mm=700)
+
+# Step 2: Check current measurements
+get_current_measurements()
+
+# Step 3: Make the chest wider
+modify_measurement(key="chest_width_mm", value=550)
+
+# Step 4: Rebuild with updated measurements
+resize_garment()
+# Deletes old patterns, re-derives all pieces, re-creates, re-sews
+```
+
+### Example 8: Import and Validate (V4)
+
+```
+# Step 1: Import an existing CLO project
+import_garment(file_path="/path/to/design.zprj", garment_type="t_shirt")
+# Scans patterns, classifies edges, maps roles by name
+
+# Step 2: Validate the imported garment
+validate_garment(garment_type="t_shirt")
+# Returns: {valid: true/false, errors: [...], warnings: [...], checks_passed: [...]}
+```
+
 ## Running Tests
 
 ```bash
@@ -419,11 +470,12 @@ pip install pytest
 python -m pytest tests/ -v
 ```
 
-The test suite includes 124 tests covering:
-- **Geometry resolver** (43 tests): edge classification, ambiguity, extended labels, determinism
-- **State manager** (22 tests): persistence, atomic writes, V2 migration, accessors, mutations
+The test suite includes 166 tests covering:
+- **Geometry resolver** (54 tests): edge classification, ambiguity, extended labels, determinism, V4 sleeve cap and armhole bodice shapes
+- **State manager** (41 tests): persistence, atomic writes, V2/V3/V4 migration, measurements, bulk operations, accessors, mutations
 - **Seam planner** (14 tests): warn mode, strict mode, tolerance, fallback, plan execution
-- **Garment types** (22 tests): derivation, registry, spec loading, A-line skirt
+- **Garment types** (27 tests): derivation (curved sleeves, armholes), registry, spec loading, A-line skirt
+- **Validator** (12 tests): seam completeness, duplicates, edge lengths, fabric, orphan pieces, pattern count
 - **MCP tools** (12 tests): create_piece, reclassify, build_tshirt stages, health endpoint
 - **Integration** (6 tests): end-to-end flows via fake TCP bridge socket
 
@@ -435,4 +487,6 @@ The test suite includes 124 tests covering:
 - **Seam blocked in strict mode** — Set `CLO_MCP_SEAM_MODE=warn` or adjust `CLO_MCP_SEAM_TOLERANCE`.
 - **Port conflict** — Change `PORT` in `clo_bridge.py` and `BRIDGE_PORT` in `mcp_server.py`.
 - **State file location** — Set `CLO_MCP_STATE_PATH` env var to customize.
-- **V2 state migration** — V2 state files are automatically migrated to V3 on first load. No manual action needed.
+- **State migration** — V2 and V3 state files are automatically migrated to V4 on first load. No manual action needed.
+- **"No measurements stored"** — Use `build_tshirt` first to create a garment with measurements before using `modify_measurement` or `resize_garment`.
+- **Import finds no patterns** — Check that the CLO file is valid and contains pattern pieces. Try opening it manually in CLO first.

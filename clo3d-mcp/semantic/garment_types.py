@@ -16,6 +16,7 @@ after testing against real CLO PatternJSON output.
 from __future__ import annotations
 
 import json
+import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -68,15 +69,14 @@ TSHIRT = GarmentType(
                        label="left_side_seam"),
         SeamDefinition("front_bodice", "right", "back_bodice", "left",
                        label="right_side_seam"),
-        # Shoulder seams — front top edges to sleeve bottom edges
-        SeamDefinition("front_bodice", "top_left", "sleeve_left", "bottom",
+        # Shoulder/armhole seams — bodice armhole curves to sleeve cap curves
+        SeamDefinition("front_bodice", "top_left", "sleeve_left", "curved_0",
                        label="left_shoulder_front"),
-        SeamDefinition("front_bodice", "top_right", "sleeve_right", "bottom",
+        SeamDefinition("front_bodice", "top_right", "sleeve_right", "curved_0",
                        label="right_shoulder_front"),
-        # Back shoulder seams
-        SeamDefinition("back_bodice", "top_left", "sleeve_left", "top",
+        SeamDefinition("back_bodice", "top_left", "sleeve_left", "curved_1",
                        label="left_shoulder_back", flip=True),
-        SeamDefinition("back_bodice", "top_right", "sleeve_right", "top",
+        SeamDefinition("back_bodice", "top_right", "sleeve_right", "curved_1",
                        label="right_shoulder_back", flip=True),
     ],
 )
@@ -121,11 +121,27 @@ DEFAULT_TSHIRT_MEASUREMENTS = {
 }
 
 
+def _polyline_arc_length(points: list[list[float]]) -> float:
+    """Compute total arc length of a polyline defined by [[x, y, ...], ...]."""
+    total = 0.0
+    for i in range(len(points) - 1):
+        dx = points[i + 1][0] - points[i][0]
+        dy = points[i + 1][1] - points[i][1]
+        total += math.sqrt(dx * dx + dy * dy)
+    return total
+
+
 def derive_tshirt_pieces(measurements: dict) -> dict[str, list[list[float]]]:
     """
     Derive pattern piece point coordinates from T-shirt measurements.
 
     Returns a dict of {role: [[x, y, curvature], ...]} for each piece.
+
+    V4: Sleeves use a 5-point shape with a curved bezier sleeve cap.
+    Bodice pieces use an 8-point shape with armhole cutouts.
+
+    The sleeve cap arc length and armhole arc length are designed to
+    approximately match for proper sewing.
 
     All coordinates are in mm. Pieces are laid out in 2D space with
     gaps between them to avoid overlap.
@@ -146,60 +162,94 @@ def derive_tshirt_pieces(measurements: dict) -> dict[str, list[list[float]]]:
     sleeve_w = float(m["sleeve_width_mm"])
     neck_drop = float(m["neck_drop_mm"])
 
-    # =====================================================================
-    # FRONT BODICE
-    # =====================================================================
+    # Derived dimensions for curved features
+    cap_height = sleeve_w * 0.3       # Sleeve cap peak height above underarm
+    armhole_depth = sleeve_w * 0.5    # How far down the armhole extends from shoulder
+
     neck_w = chest_w - shoulder_w
     neck_half = neck_w / 2.0
     center_x = chest_w / 2.0
 
+    # =====================================================================
+    # FRONT BODICE — 8 points with armhole cutouts
+    #
+    # Shape outline (counter-clockwise from bottom-left):
+    #   P0: hem bottom-left
+    #   P1: left side at armhole depth
+    #   P2: left armhole curve (bezier) — curves inward at shoulder
+    #   P3: neck-left (bezier)
+    #   P4: neck-right (bezier)
+    #   P5: right armhole curve (bezier)
+    #   P6: right side at armhole depth
+    #   P7: hem bottom-right
+    #
+    # The armhole runs from P1→P2 (left) and P5→P6 (right).
+    # These curved edges will be sewn to the sleeve cap.
+    # =====================================================================
     front_bodice = [
-        [0.0, 0.0, 0],                                    # P0: bottom-left
-        [0.0, body_l, 0],                                  # P1: top-left (shoulder)
-        [center_x - neck_half, body_l - neck_drop, 3],     # P2: neck-left (bezier curve)
-        [center_x + neck_half, body_l - neck_drop, 3],     # P3: neck-right (bezier curve)
-        [chest_w, body_l, 0],                              # P4: top-right (shoulder)
-        [chest_w, 0.0, 0],                                 # P5: bottom-right
+        [0.0, 0.0, 0],                                        # P0: bottom-left (hem)
+        [0.0, body_l - armhole_depth, 0],                      # P1: left armhole bottom
+        [0.0, body_l, 3],                                      # P2: left armhole top (bezier)
+        [center_x - neck_half, body_l - neck_drop, 3],         # P3: neck-left (bezier)
+        [center_x + neck_half, body_l - neck_drop, 3],         # P4: neck-right (bezier)
+        [chest_w, body_l, 3],                                  # P5: right armhole top (bezier)
+        [chest_w, body_l - armhole_depth, 0],                  # P6: right armhole bottom
+        [chest_w, 0.0, 0],                                     # P7: bottom-right (hem)
     ]
 
     # =====================================================================
-    # BACK BODICE
+    # BACK BODICE — 8 points with armhole cutouts (shallower neck)
     # =====================================================================
     back_neck_drop = neck_drop * 0.4
     bx = chest_w + 100.0
 
     back_bodice = [
-        [bx, 0.0, 0],                                          # P0: bottom-left
-        [bx, body_l, 0],                                       # P1: top-left (shoulder)
-        [bx + center_x - neck_half, body_l - back_neck_drop, 3],  # P2: neck-left
-        [bx + center_x + neck_half, body_l - back_neck_drop, 3],  # P3: neck-right
-        [bx + chest_w, body_l, 0],                              # P4: top-right (shoulder)
-        [bx + chest_w, 0.0, 0],                                 # P5: bottom-right
+        [bx, 0.0, 0],                                                # P0: bottom-left
+        [bx, body_l - armhole_depth, 0],                              # P1: left armhole bottom
+        [bx, body_l, 3],                                              # P2: left armhole top (bezier)
+        [bx + center_x - neck_half, body_l - back_neck_drop, 3],     # P3: neck-left
+        [bx + center_x + neck_half, body_l - back_neck_drop, 3],     # P4: neck-right
+        [bx + chest_w, body_l, 3],                                    # P5: right armhole top
+        [bx + chest_w, body_l - armhole_depth, 0],                    # P6: right armhole bottom
+        [bx + chest_w, 0.0, 0],                                       # P7: bottom-right
     ]
 
     # =====================================================================
-    # LEFT SLEEVE
+    # LEFT SLEEVE — 5 points with curved bezier sleeve cap
+    #
+    # Shape outline:
+    #   P0: bottom-left (cuff)
+    #   P1: top-left (underarm)
+    #   P2: cap apex — center, raised by cap_height (bezier)
+    #   P3: top-right (underarm)
+    #   P4: bottom-right (cuff)
+    #
+    # The cap runs P1→P2 (curved_0) and P2→P3 (curved_1).
+    # These two edges are sewn to the front and back armholes.
     # =====================================================================
     sx_l = 0.0
     sy = -sleeve_l - 100.0
+    cap_y = sy + sleeve_l  # Y coordinate of the underarm line
 
     sleeve_left = [
-        [sx_l, sy, 0],                       # P0: bottom-left (cuff)
-        [sx_l, sy + sleeve_l, 0],            # P1: top-left (armhole side)
-        [sx_l + sleeve_w, sy + sleeve_l, 0], # P2: top-right (armhole side)
-        [sx_l + sleeve_w, sy, 0],            # P3: bottom-right (cuff)
+        [sx_l, sy, 0],                                     # P0: bottom-left (cuff)
+        [sx_l, cap_y, 0],                                  # P1: top-left (underarm)
+        [sx_l + sleeve_w / 2.0, cap_y + cap_height, 3],   # P2: cap apex (bezier)
+        [sx_l + sleeve_w, cap_y, 0],                       # P3: top-right (underarm)
+        [sx_l + sleeve_w, sy, 0],                          # P4: bottom-right (cuff)
     ]
 
     # =====================================================================
-    # RIGHT SLEEVE
+    # RIGHT SLEEVE — 5 points with curved bezier sleeve cap
     # =====================================================================
     sx_r = sleeve_w + 100.0
 
     sleeve_right = [
-        [sx_r, sy, 0],                       # P0: bottom-left (cuff)
-        [sx_r, sy + sleeve_l, 0],            # P1: top-left (armhole side)
-        [sx_r + sleeve_w, sy + sleeve_l, 0], # P2: top-right (armhole side)
-        [sx_r + sleeve_w, sy, 0],            # P3: bottom-right (cuff)
+        [sx_r, sy, 0],                                     # P0: bottom-left (cuff)
+        [sx_r, cap_y, 0],                                  # P1: top-left (underarm)
+        [sx_r + sleeve_w / 2.0, cap_y + cap_height, 3],   # P2: cap apex (bezier)
+        [sx_r + sleeve_w, cap_y, 0],                       # P3: top-right (underarm)
+        [sx_r + sleeve_w, sy, 0],                          # P4: bottom-right (cuff)
     ]
 
     return {

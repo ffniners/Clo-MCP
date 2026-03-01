@@ -451,3 +451,154 @@ class TestLineIndexStability:
             assert result.labels["bottom"] == 3
             assert result.labels["left"] == 0
             assert result.labels["right"] == 2
+
+
+# -------------------------------------------------------------------------
+# V4: Curved sleeve cap and armhole bodice shapes
+# -------------------------------------------------------------------------
+
+
+def make_sleeve_cap(sleeve_w=180, sleeve_l=220, cap_height=54) -> list[Edge]:
+    """
+    5-point sleeve with curved bezier cap (V4 shape).
+
+    Points CCW from bottom-left:
+      P0: bottom-left (cuff)
+      P1: top-left (underarm)
+      P2: cap apex (center, raised) — curvature=3
+      P3: top-right (underarm)
+      P4: bottom-right (cuff)
+
+    Edges:
+      0: P0→P1 = left side (vertical)
+      1: P1→P2 = left half of cap (curved)
+      2: P2→P3 = right half of cap (curved)
+      3: P3→P4 = right side (vertical)
+      4: P4→P0 = bottom (cuff, horizontal)
+    """
+    sy = -sleeve_l - 100.0
+    cap_y = sy + sleeve_l
+    points = [
+        Point(0.0, sy, 0),
+        Point(0.0, cap_y, 0),
+        Point(sleeve_w / 2.0, cap_y + cap_height, 3),
+        Point(sleeve_w, cap_y, 0),
+        Point(sleeve_w, sy, 0),
+    ]
+    return build_edges_from_creation_points(points)
+
+
+def make_armhole_bodice(
+    chest_w=500, body_l=700, armhole_depth=90,
+    neck_half=40, neck_drop=80, x_offset=0.0
+) -> list[Edge]:
+    """
+    8-point bodice with armhole cutouts (V4 shape).
+
+    Points CCW from bottom-left:
+      P0: bottom-left (hem)
+      P1: left armhole bottom
+      P2: left armhole top (bezier)
+      P3: neck-left (bezier)
+      P4: neck-right (bezier)
+      P5: right armhole top (bezier)
+      P6: right armhole bottom
+      P7: bottom-right (hem)
+
+    Edges:
+      0: P0→P1 = bottom-left side
+      1: P1→P2 = left armhole curve
+      2: P2→P3 = left shoulder to neck
+      3: P3→P4 = neckline
+      4: P4→P5 = right shoulder from neck
+      5: P5→P6 = right armhole curve
+      6: P6→P7 = bottom-right side
+      7: P7→P0 = hem (bottom)
+    """
+    cx = chest_w / 2.0
+    points = [
+        Point(x_offset, 0.0, 0),
+        Point(x_offset, body_l - armhole_depth, 0),
+        Point(x_offset, body_l, 3),
+        Point(x_offset + cx - neck_half, body_l - neck_drop, 3),
+        Point(x_offset + cx + neck_half, body_l - neck_drop, 3),
+        Point(x_offset + chest_w, body_l, 3),
+        Point(x_offset + chest_w, body_l - armhole_depth, 0),
+        Point(x_offset + chest_w, 0.0, 0),
+    ]
+    return build_edges_from_creation_points(points)
+
+
+class TestClassifySleeveCapShape:
+    """V4: Classify a 5-point sleeve with curved cap."""
+
+    def test_five_edges(self):
+        edges = make_sleeve_cap()
+        assert len(edges) == 5
+
+    def test_has_curved_labels(self):
+        edges = make_sleeve_cap()
+        result = classify_edges(edges)
+        # Edges 1 and 2 are curved (P2 has curvature=3)
+        assert "curved" in result.labels
+        assert "curved_0" in result.labels
+        assert "curved_1" in result.labels
+
+    def test_bottom_is_cuff(self):
+        edges = make_sleeve_cap()
+        result = classify_edges(edges)
+        # The lowest edge should be the bottom (cuff)
+        assert result.labels["bottom"] == 4
+
+    def test_left_and_right(self):
+        edges = make_sleeve_cap()
+        result = classify_edges(edges)
+        assert result.labels["left"] == 0
+        assert result.labels["right"] == 3
+
+    def test_extended_has_top_labels(self):
+        edges = make_sleeve_cap()
+        result = classify_edges_extended(edges)
+        # Should have top_left and top_right in upper region
+        assert "top_left" in result.labels
+        assert "top_right" in result.labels
+
+
+class TestClassifyArmholeBodiceShape:
+    """V4: Classify an 8-point bodice with armhole cutouts."""
+
+    def test_eight_edges(self):
+        edges = make_armhole_bodice()
+        assert len(edges) == 8
+
+    def test_has_curved_labels(self):
+        edges = make_armhole_bodice()
+        result = classify_edges(edges)
+        # Multiple curved edges (armhole and neck bezier points)
+        assert "curved" in result.labels
+        assert "curved_0" in result.labels
+
+    def test_bottom_is_hem(self):
+        edges = make_armhole_bodice()
+        result = classify_edges(edges)
+        # Edge 7 (P7→P0) is the hem at Y=0
+        assert result.labels["bottom"] == 7
+
+    def test_extended_top_left_right(self):
+        edges = make_armhole_bodice()
+        result = classify_edges_extended(edges)
+        # Top-region edges should be assigned top_left / top_right
+        assert "top_left" in result.labels
+        assert "top_right" in result.labels
+        # top_left should be a left-side edge, top_right a right-side edge
+        tl_idx = result.labels["top_left"]
+        tr_idx = result.labels["top_right"]
+        assert tl_idx != tr_idx
+
+    def test_left_and_right(self):
+        edges = make_armhole_bodice()
+        result = classify_edges(edges)
+        # Left edge should be among the low-x edges
+        left_idx = result.labels["left"]
+        right_idx = result.labels["right"]
+        assert edges[left_idx].avg_x < edges[right_idx].avg_x
